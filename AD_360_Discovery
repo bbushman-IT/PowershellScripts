@@ -1,0 +1,355 @@
+
+<#
+.SYNOPSIS
+  Discovery script to prepare for absorbing a domain into another domain.
+  Collects active users, security groups, GPOs, server inventory & roles, and FSMO/DC info.
+
+.PARAMETER TargetDomain
+  FQDN of the source domain to be inventoried (e.g., contoso.com).
+
+.PARAMETER Credential
+  Credentials with read access to AD and GPOs in the source domain. If omitted, current context is used.
+
+.PARAMETER OutputPath
+  Root output folder. Defaults to .\Discovery_<domain>_<yyyyMMdd_HHmmss>.
+
+.PARAMETER IncludeGroupMembers
+  Also exports recursive membership for each security group (can be large).
+
+.PARAMETER PingBeforeInventory
+  Ping test before connecting to each server (skips unreachable hosts).
+
+.PARAMETER ServersOU
+  Optional AD OU DN to limit server discovery (e.g., 'OU=Servers,DC=contoso,DC=com').
+
+.EXAMPLE
+  .\AD-Discovery.ps1 -TargetDomain contoso.com -Credential (Get-Credential) -IncludeGroupMembers -PingBeforeInventory
+
+.NOTES
+  Requires RSAT: ActiveDirectory & GroupPolicy modules. Server role enumeration uses CIM/WMI and
+  falls back to PowerShell remoting with ServerManager where available.
+#>
+
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$true)]
+  [string]$TargetDomain,
+
+  [Parameter(Mandatory=$false)]
+  [System.Management.Automation.PSCredential]$Credential,
+
+  [Parameter(Mandatory=$false)]
+  [string]$OutputPath,
+
+  [switch]$IncludeGroupMembers,
+  [switch]$PingBeforeInventory,
+
+  [string]$ServersOU,
+
+  [Parameter(Mandatory=$false)]
+  [int]$StaleDays = 180
+
+)
+
+function Ensure-Module {
+  param([string]$Name)
+  if (-not (Get-Module -ListAvailable -Name $Name)) {
+    Write-Warning "Module '$Name' not found. Install RSAT or add the module."
+    throw "Required module '$Name' is missing."
+  }
+  Import-Module $Name -ErrorAction Stop
+}
+
+function Convert-FileTime {
+  param([Nullable[long]]$FileTime)
+  if ($FileTime -and $FileTime -gt 0) { [DateTime]::FromFileTime($FileTime) } else { $null }
+}
+
+function New-DiscoveryPaths {
+  param([string]$BasePath)
+  $paths = @{
+    Root    = $BasePath
+    Users   = Join-Path $BasePath 'Users'
+    Groups  = Join-Path $BasePath 'Groups'
+    GPOs    = Join-Path $BasePath 'GPOs'
+    GPOXML  = Join-Path $BasePath 'GPOs\XML'
+    Servers = Join-Path $BasePath 'Servers'
+    Domain  = Join-Path $BasePath 'Domain'
+  }
+  $paths.GetEnumerator() | ForEach-Object { New-Item -ItemType Directory -Force -Path $_.Value | Out-Null }
+  return $paths
+}
+
+function Get-ADSessionArg {
+  # Returns a hashtable usable in AD cmdlets for -Server and -Credential
+  param([string]$Domain, [System.Management.Automation.PSCredential]$Cred)
+  $args = @{ Server = $Domain }
+  if ($Cred) { $args.Credential = $Cred }
+  return $args
+}
+
+function Get-ServerFeaturesCIM {
+  [CmdletBinding()]
+  param(
+    [string]$ComputerName,
+    [System.Management.Automation.PSCredential]$Credential
+  )
+  $features = @()
+  try {
+    # Try WSMan CIM first
+    $session = New-CimSession -ComputerName $ComputerName -Credential $Credential -ErrorAction Stop
+    $features = Get-CimInstance -CimSession $session -ClassName Win32_ServerFeature -ErrorAction Stop
+    $session | Remove-CimSession
+    if ($features) { return $features | Select-Object @{n='ComputerName';e={$ComputerName}}, ID, Name }
+  } catch {
+    # Fall back to DCOM CIM
+    try {
+      $opt = New-CimSessionOption -Protocol DCOM
+      $session = New-CimSession -ComputerName $ComputerName -Credential $Credential -SessionOption $opt -ErrorAction Stop
+      $features = Get-CimInstance -CimSession $session -ClassName Win32_ServerFeature -ErrorAction Stop
+      $session | Remove-CimSession
+      if ($features) { return $features | Select-Object @{n='ComputerName';e={$ComputerName}}, ID, Name }
+    } catch {
+      return $null
+    }
+  }
+}
+
+function Get-ServerFeaturesRemote {
+  [CmdletBinding()]
+  param(
+    [string]$ComputerName,
+    [System.Management.Automation.PSCredential]$Credential
+  )
+  try {
+    $script = {
+      Import-Module ServerManager -ErrorAction Stop
+      Get-WindowsFeature | Where-Object { $_.Installed -eq $true } |
+        Select-Object @{n='ComputerName';e={$env:COMPUTERNAME}},
+                      @{n='ID';e={$_.Name}},
+                      @{n='Name';e={$_.DisplayName}}
+    }
+    return Invoke-Command -ComputerName $ComputerName -Credential $Credential -ScriptBlock $script -ErrorAction Stop
+  } catch {
+    return $null
+  }
+}
+
+function Test-ServerReachability {
+  param([string]$ComputerName, [switch]$PingFirst)
+  if ($PingFirst) {
+    try {
+      $ping = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction SilentlyContinue
+      return [bool]$ping
+    } catch { return $false }
+  } else {
+    return $true
+  }
+}
+
+# ---- Main ----
+try {
+  Ensure-Module -Name ActiveDirectory
+  Ensure-Module -Name GroupPolicy
+
+  if (-not $OutputPath) {
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $OutputPath = Join-Path (Get-Location) "Discovery_${TargetDomain}_$stamp"
+  }
+  $paths = New-DiscoveryPaths -BasePath $OutputPath
+
+  $adArgs = Get-ADSessionArg -Domain $TargetDomain -Cred $Credential
+
+  Start-Transcript -Path (Join-Path $paths.Root 'discovery_transcript.txt') -Force
+
+  
+Write-Host "=== Collecting ACTIVE USERS from $TargetDomain ==="
+$userProps = @('SamAccountName','UserPrincipalName','DisplayName','Enabled','WhenCreated','LastLogonTimestamp','PwdLastSet','Description','MemberOf','DistinguishedName')
+$users = Get-ADUser @adArgs -LDAPFilter '(userAccountControl:1.2.840.113556.1.4.803:=512)' -Properties $userProps -ResultPageSize 2000 -ErrorAction Stop |
+         Where-Object { $_.Enabled -eq $true }
+$usersOut = $users | Select-Object `
+  @{n='SamAccountName';e={$_.SamAccountName}},
+  @{n='UPN';e={$_.UserPrincipalName}},
+  @{n='DisplayName';e={$_.DisplayName}},
+  @{n='Enabled';e={$_.Enabled}},
+  @{n='Created';e={$_.WhenCreated}},
+  @{n='LastLogonApprox';e={ Convert-FileTime $_.LastLogonTimestamp }},
+  @{n='PwdLastSet';e={ if ($_.PwdLastSet) { [DateTime]::FromFileTime($_.PwdLastSet) } else { $null } }},
+  @{n='Description';e={$_.Description}},
+  @{n='GroupsCount';e={ ($_.MemberOf | Measure-Object).Count }},
+  @{n='DN';e={$_.DistinguishedName}}
+$usersOut | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Join-Path $paths.Users 'active_users.csv')
+Write-Host "Users exported: $($usersOut.Count)"
+
+Write-Host "=== Evaluating STALE USERS (LastLogonApprox older than $StaleDays days) ==="
+$staleThreshold = (Get-Date).AddDays(-1 * $StaleDays)
+$staleUsers = $usersOut | Where-Object {
+  if (-not $_.LastLogonApprox) { return $true }
+  try { [DateTime]$_.LastLogonApprox -lt $staleThreshold } catch { $true }
+}
+$staleCsvPath = Join-Path $paths.Users ("stale_users_{0}d.csv" -f $StaleDays)
+$staleUsers | Select-Object SamAccountName, UPN, DisplayName, Enabled, Created, LastLogonApprox, PwdLastSet, Description, GroupsCount, DN |
+  Export-Csv -NoTypeInformation -Encoding UTF8 -Path $staleCsvPath
+
+$summary = @()
+$summary += "Stale user evaluation for domain: $TargetDomain"
+$summary += "Threshold: LastLogonApprox older than $StaleDays days (Date: $($staleThreshold.ToString('yyyy-MM-dd HH:mm:ss')))"
+$summary += "Total active users evaluated: $($usersOut.Count)"
+$summary += "Total stale users: $($staleUsers.Count)"
+$summary += ""
+$summary += "Notes:"
+$summary += "- LastLogonApprox is based on replicated lastLogonTimestamp (approximate)."
+$summary += "- Users with null LastLogonApprox are treated as stale (never set/unknown)."
+$summary += "- For precise last logon, query per-DC 'lastLogon' and take the max."
+$summaryPath = Join-Path $paths.Users ("stale_users_summary_{0}d.txt" -f $StaleDays)
+$summary | Out-File -FilePath $summaryPath -Encoding UTF8
+
+Write-Host "Stale users exported: $($staleUsers.Count) -> $staleCsvPath"
+Write-Host "Stale users summary: $summaryPath"
+
+
+  Write-Host "=== Collecting SECURITY GROUPS from $TargetDomain ==="
+  $grpProps = @('Name','SamAccountName','GroupCategory','GroupScope','Description','WhenCreated','ManagedBy','DistinguishedName')
+  $secGroups = Get-ADGroup @adArgs -Filter 'GroupCategory -eq "Security"' -Properties $grpProps -ErrorAction Stop
+  $secGroupsOut = $secGroups | Select-Object `
+    Name, SamAccountName, GroupCategory, GroupScope,
+    @{n='Created';e={$_.WhenCreated}},
+    Description, ManagedBy,
+    @{n='DN';e={$_.DistinguishedName}}
+  $secGroupsOut | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Join-Path $paths.Groups 'security_groups.csv')
+  Write-Host "Security groups exported: $($secGroupsOut.Count)"
+
+  if ($IncludeGroupMembers) {
+    Write-Host "=== Expanding SECURITY GROUP MEMBERSHIP (recursive) ==="
+    $membershipOut = foreach ($g in $secGroups) {
+      try {
+        Get-ADGroupMember @adArgs -Identity $g.DistinguishedName -Recursive -ErrorAction Stop | ForEach-Object {
+          [PSCustomObject]@{
+            GroupName   = $g.Name
+            GroupSam    = $g.SamAccountName
+            MemberName  = $_.Name
+            MemberSam   = $_.SamAccountName
+            MemberType  = $_.ObjectClass
+            MemberDN    = $_.DistinguishedName
+          }
+        }
+      } catch {
+        [PSCustomObject]@{
+          GroupName   = $g.Name
+          GroupSam    = $g.SamAccountName
+          MemberName  = $null
+          MemberSam   = $null
+          MemberType  = "ERROR: $($_.Exception.Message)"
+          MemberDN    = $null
+        }
+      }
+    }
+    $membershipOut | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Join-Path $paths.Groups 'group_membership.csv')
+    Write-Host "Group membership entries exported: $(($membershipOut | Measure-Object).Count)"
+  }
+
+
+Write-Host "=== Collecting GPOs and exporting reports ==="
+
+# Build args ONLY with parameters supported by GroupPolicy cmdlets
+$gpoArgs = @{ Domain = $TargetDomain }
+if ($Credential) { $gpoArgs.Credential = $Credential }
+
+# Get all GPOs
+$gpos = Get-GPO -All @gpoArgs -ErrorAction Stop
+
+# Summary CSV
+$gpoSummary = $gpos | Select-Object `
+  DisplayName, Id,
+  @{n='CreatedTime';e={$_.CreationTime}},
+  @{n='ModifiedTime';e={$_.ModificationTime}},
+  @{n='Owner';e={$_.Owner}},
+  @{n='WmiFilter';e={$_.WmiFilter}},
+  @{n='GpoStatus';e={$_.GpoStatus}}
+$gpoSummary | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Join-Path $paths.GPOs 'gpo_summary.csv')
+
+# Full domain-level HTML report
+Get-GPOReport -All @gpoArgs -ReportType Html -Path (Join-Path $paths.GPOs 'GPOs.html')
+
+# Per-GPO XML reports
+foreach ($g in $gpos) {
+  $safeName = ($g.DisplayName -replace '[^\w\-]','_')
+  $xmlPath = Join-Path $paths.GPOXML ("{0}_{1}.xml" -f $safeName, $g.Id)
+  Get-GPOReport -Guid $g.Id @gpoArgs -ReportType Xml -Path $xmlPath
+}
+
+Write-Host "GPO reports exported: $($gpos.Count)"
+
+
+  Write-Host "=== Collecting SERVER INVENTORY and ROLES/FEATURES ==="
+  $serverFilter = 'OperatingSystem -like "*Server*" -and Enabled -eq $true'
+  if ($ServersOU) {
+    $servers = Get-ADComputer @adArgs -SearchBase $ServersOU -LDAPFilter '(operatingSystem=*Server*)' -Properties IPv4Address,OperatingSystem,DNSHostName,Enabled -ErrorAction Stop
+  } else {
+    $servers = Get-ADComputer @adArgs -Filter $serverFilter -Properties IPv4Address,OperatingSystem,DNSHostName,Enabled -ErrorAction Stop
+  }
+  $serversOut = $servers | Select-Object `
+    @{n='ComputerName';e={$_.Name}},
+    @{n='DNSHostName';e={$_.DNSHostName}},
+    @{n='IPv4';e={$_.IPv4Address}},
+    @{n='OperatingSystem';e={$_.OperatingSystem}},
+    @{n='Enabled';e={$_.Enabled}},
+    @{n='DN';e={$_.DistinguishedName}}
+  $serversOut | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Join-Path $paths.Servers 'servers.csv')
+  Write-Host "Servers discovered: $($serversOut.Count)"
+
+  $featuresAll = New-Object System.Collections.Generic.List[object]
+  foreach ($s in $serversOut) {
+    $cn = $s.DNSHostName
+    if (-not $cn) { $cn = $s.ComputerName }
+    if (-not $cn) { continue }
+
+    $reachable = Test-ServerReachability -ComputerName $cn -PingFirst:$PingBeforeInventory
+    if (-not $reachable) {
+      Write-Warning "Skipping unreachable server: $cn"
+      continue
+    }
+
+    $features = Get-ServerFeaturesCIM -ComputerName $cn -Credential $Credential
+    if (-not $features) {
+      $features = Get-ServerFeaturesRemote -ComputerName $cn -Credential $Credential
+    }
+    if ($features) {
+      foreach ($f in $features) {
+        $featuresAll.Add([PSCustomObject]@{
+          ComputerName = $cn
+          FeatureID    = $f.ID
+          FeatureName  = $f.Name
+          Source       = if ($f.PSObject.Properties.Name -contains 'ID' -and $f.PSObject.Properties.Name -contains 'Name') { 'CIM/WMI' } else { 'ServerManager' }
+        })
+      }
+    } else {
+      Write-Warning "Could not enumerate features on $cn (consider enabling WinRM or checking firewall/WMI permissions)."
+    }
+  }
+  $featuresAll | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Join-Path $paths.Servers 'server_features.csv')
+  Write-Host "Server features entries exported: $(($featuresAll | Measure-Object).Count)"
+
+  Write-Host "=== Collecting DOMAIN CONTROLLERS and FSMO ROLES ==="
+  $dcs = Get-ADDomainController @adArgs -Filter * -ErrorAction Stop
+  $dcs | Select-Object HostName, IPv4Address, Site, IsReadOnly, OperatingSystem, Enabled, DistinguishedName |
+    Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Join-Path $paths.Domain 'domain_controllers.csv')
+
+  $forest = Get-ADForest @adArgs
+  $domain  = Get-ADDomain  @adArgs
+  [PSCustomObject]@{
+    Domain             = $TargetDomain
+    SchemaMaster       = $forest.SchemaMaster
+    DomainNamingMaster = $forest.DomainNamingMaster
+    PDCEmulator        = $domain.PDCEmulator
+    RIDMaster          = $domain.RIDMaster
+    InfrastructureMaster = $domain.InfrastructureMaster
+  } | Export-Csv -NoTypeInformation -Encoding UTF8 -Path (Join-Path $paths.Domain 'fsmo_roles.csv')
+
+  Write-Host "=== Discovery COMPLETE ==="
+  Write-Host "Output folder: $($paths.Root)"
+} catch {
+  Write-Error $_
+} finally {
+  Stop-Transcript | Out-Null
+}
